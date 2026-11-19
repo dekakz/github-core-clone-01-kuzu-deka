@@ -1,23 +1,29 @@
-// github-core-clone-01 entrypoint: the forge server lifecycle only — the forge itself lives in app.ts.
+// github-core-clone-01 entrypoint: the forge server lifecycle only — the forge itself is the
+// statically linked Go binary ./forge beside this file (Go source in *.go, built with
+// CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"). This launcher spawns it, reads the
+// ephemeral port it bound from its stdout, and runs the env lifecycle around it.
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// the suite scores the server the forge builds, and the lifecycle is the harness's, not the contest's.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
+//   2. Spawn ./forge: it binds an ephemeral port itself and prints "[forge] listening on port N".
+//      Never bind 8080 — the env owns it.
 //   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
 //      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
 //      entry already registered, and this process keeps waiting like any other.
 //   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
 //      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
 //      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
+//   5. Stop the forge and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// main.ts spawns its own server and nothing else: no package, no model call.
 
-import { createApp } from './app.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -77,22 +83,55 @@ async function waitForDone(): Promise<void> {
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+/** How long the forge may take to print its port before the entry gives up. */
+const FORGE_START_TIMEOUT_MS = 10_000;
+
+/**
+ * Spawn ./forge (beside this file) and wait for its "[forge] listening on port N" line.
+ * The forge binds the ephemeral port itself, so there is no bind-then-hand-over race.
+ */
+async function startForge(): Promise<{ child: ChildProcess; port: number }> {
+  const dir = dirname(fileURLToPath(import.meta.url));
+  const child = spawn(join(dir, 'forge'), [], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env },
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  const port = await new Promise<number>((resolve, reject) => {
+    let buf = '';
+    const timer = setTimeout(() => reject(new Error('forge did not report a port within 10s')), FORGE_START_TIMEOUT_MS);
+    child.stdout?.on('data', (chunk: Buffer) => {
+      buf += chunk.toString('utf8');
+      const m = /\[forge\] listening on port (\d+)/.exec(buf);
+      if (m) {
+        clearTimeout(timer);
+        resolve(Number(m[1]));
+      }
+    });
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`forge exited early with code ${code}`));
+    });
+  });
+  return { child, port };
+}
 
-  await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
+/** Start the forge, register its port, then wait for the env: the whole life of the process. */
+async function main(): Promise<void> {
+  const { child, port } = await startForge();
+  process.stdout.write(`[entry] listening on port ${port}\n`);
 
-  await waitForDone();
-  server.close();
+  try {
+    await register(port);
+    process.stdout.write('[entry] registered; waiting for the env to say done\n');
+
+    await waitForDone();
+  } finally {
+    child.kill('SIGTERM');
+  }
   process.stdout.write('[entry] done\n');
 }
 
