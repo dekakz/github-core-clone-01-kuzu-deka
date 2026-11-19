@@ -6,7 +6,6 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
-	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
@@ -798,6 +797,7 @@ func (s *server) resolveTop(op *gqlOp, data map[string]any, errors *[]string) {
 					id: nextEntityID(), number: number, title: jsStr(getField(input, "title")),
 					body: jsStr(getField(input, "body")), state: "open", labels: []string{},
 					seq: number, createdAt: isoOf(sec), updatedAt: isoOf(sec), comments: []*comment{},
+					nodeID: gid("issue", viewerLogin+"/"+rp.name+":"+strconv.Itoa(number)),
 				}
 				rp.issues[number] = iss
 				rp.issuesOrder = append(rp.issuesOrder, iss)
@@ -831,6 +831,7 @@ func (s *server) resolveTop(op *gqlOp, data map[string]any, errors *[]string) {
 				}
 				found.state = "closed"
 				found.updatedAt = nowIso()
+				found.invalidateJSON()
 				var sel []*gqlField
 				for _, sub := range f.selections {
 					if sub.name == "issue" {
@@ -957,6 +958,7 @@ func (s *server) resolveTop(op *gqlOp, data map[string]any, errors *[]string) {
 				}
 				c := &comment{id: nextEntityID(), body: jsStr(getField(input, "body")), createdAt: nowIso()}
 				found.comments = append(found.comments, c)
+				found.invalidateJSON()
 				data[key] = map[string]any{"commentEdge": map[string]any{"node": map[string]any{
 					"id":   gid("comment", viewerLogin+"/"+foundRepo.name+":"+strconv.Itoa(found.number)+":"+strconv.FormatInt(c.id, 10)),
 					"body": c.body,
@@ -974,7 +976,7 @@ func atoi(s string) int {
 	return n
 }
 
-func (s *server) handleGraphql(w http.ResponseWriter, r *http.Request, body []byte) {
+func (s *server) handleGraphql(w *fastResp, r *fastReq, body []byte) {
 	if !isAuthed(r) {
 		s.sendErr(w, 401, "Bad credentials", nil)
 		return

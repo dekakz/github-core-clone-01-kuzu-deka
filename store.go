@@ -82,6 +82,7 @@ const (
 )
 
 var token = ""
+var bearerToken = ""
 
 // ------------------------------------------------------------------ git objects
 
@@ -275,6 +276,21 @@ type issue struct {
 	createdAt string
 	updatedAt string
 	comments  []*comment
+	// nodeID is the precomputed gid("issue", owner/repo:number).
+	nodeID string
+	// cached holds the last rendered issue JSON; nil when stale. Atomic so
+	// a GET under RLock can publish it without a write lock. The bytes are
+	// never mutated after publishing. Cleared on any mutation of the issue
+	// or of the repo's labels (label colours are part of the JSON).
+	cached atomic.Pointer[[]byte]
+}
+
+func (i *issue) invalidateJSON() { i.cached.Store(nil) }
+
+func (r *repo) invalidateIssueJSON() {
+	for _, i := range r.issuesOrder {
+		i.invalidateJSON()
+	}
 }
 
 type pull struct {
@@ -303,6 +319,10 @@ type cachedPack struct {
 	pack       []byte
 	newShallow []string
 	unshallow  []string
+	// resp is the complete fetch response bytes (acknowledgments/NAK,
+	// shallow-info, packfile framing) built once on a cache miss, so a
+	// cache hit is a single write with no re-assembly or pack copies.
+	resp []byte
 }
 
 type repo struct {
@@ -345,6 +365,19 @@ func (s *store) putObject(typ objType, data []byte) string {
 		cp := make([]byte, len(data))
 		copy(cp, data)
 		s.objects[oid] = &gitObj{typ: typ, data: cp}
+	}
+	return oid
+}
+
+// putObjectOID stores data under a precomputed oid without re-hashing and
+// without copying: the caller guarantees data is freshly allocated and not
+// reused elsewhere (readPack's inflated/delta output). Caller holds a lock.
+func (s *store) putObjectOID(typ objType, data []byte, oid string) string {
+	if oid == "" {
+		return s.putObject(typ, data)
+	}
+	if _, ok := s.objects[oid]; !ok {
+		s.objects[oid] = &gitObj{typ: typ, data: data}
 	}
 	return oid
 }

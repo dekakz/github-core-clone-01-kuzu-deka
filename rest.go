@@ -5,14 +5,13 @@ package main
 import (
 	"encoding/base64"
 	"math"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-func (s *server) handleRest(w http.ResponseWriter, r *http.Request, path string, q *queryParams, body []byte) bool {
-	method := r.Method
+func (s *server) handleRest(w *fastResp, r *fastReq, path string, q *queryParams, body []byte) bool {
+	method := r.method
 	segs := splitPath(path)
 	if len(segs) < 2 || segs[0] != "api" || segs[1] != "v3" {
 		return false
@@ -63,7 +62,7 @@ func (s *server) handleRest(w http.ResponseWriter, r *http.Request, path string,
 				list = append(list, s.repoJSON(rp))
 			}
 			s.st.mu.RUnlock()
-			page, link := paginate(list, q, r.Host, "/api/v3/user/repos")
+			page, link := paginate(list, q, r.host, "/api/v3/user/repos")
 			s.sendJSON(w, 200, page, linkHeader(link))
 			return true
 		}
@@ -114,7 +113,7 @@ func getField(m map[string]any, k string) any {
 	return m[k]
 }
 
-func (s *server) handleRepo(w http.ResponseWriter, r *http.Request, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
+func (s *server) handleRepo(w *fastResp, r *fastReq, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
 	if len(tail) == 0 {
 		if method == "GET" {
 			s.st.mu.RLock()
@@ -313,6 +312,7 @@ func (s *server) handleRepo(w http.ResponseWriter, r *http.Request, rp *repo, ow
 			color := jsStrDef(getField(parsed, "color"), "ededed")
 			s.st.mu.Lock()
 			rp.labels[lname] = &label{name: lname, color: color}
+			rp.invalidateIssueJSON()
 			found := false
 			for _, n := range rp.labelsOrder {
 				if n == lname {
@@ -347,7 +347,7 @@ type shaJSON struct {
 	URL string `json:"url"`
 }
 
-func (s *server) handleContents(w http.ResponseWriter, r *http.Request, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
+func (s *server) handleContents(w *fastResp, r *fastReq, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
 	filePath := strings.Join(tail, "/")
 	refParam := q.get("ref")
 	hasRef := q.has("ref")
@@ -576,7 +576,7 @@ func lenientB64Decode(s string) []byte {
 	return out
 }
 
-func (s *server) handleIssues(w http.ResponseWriter, r *http.Request, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
+func (s *server) handleIssues(w *fastResp, r *fastReq, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
 	if len(tail) == 1 {
 		if method == "GET" {
 			s.st.mu.RLock()
@@ -611,31 +611,17 @@ func (s *server) handleIssues(w http.ResponseWriter, r *http.Request, rp *repo, 
 				jsonList = append(jsonList, s.issueJSON(rp, i))
 			}
 			s.st.mu.RUnlock()
-			page, link := paginate(jsonList, q, r.Host, "/api/v3/repos/"+owner+"/"+name+"/issues")
+			page, link := paginate(jsonList, q, r.host, "/api/v3/repos/"+owner+"/"+name+"/issues")
 			s.sendJSON(w, 200, page, linkHeader(link))
 			return true
 		}
 		if method == "POST" {
-			parsed, ok := jsonBody(method, body)
-			if !ok {
-				return badJSON()
-			}
 			var labelNames []string
-			if raw, isArr := parsed["labels"].([]any); isArr {
-				for _, l := range raw {
-					var ln string
-					var isLabel bool
-					switch t := l.(type) {
-					case string:
-						ln, isLabel = t, true
-					case map[string]any:
-						if n, isStr := t["name"].(string); isStr {
-							ln, isLabel = n, true
-						}
-					}
-					if !isLabel {
-						continue
-					}
+			var titleText, bodyText string
+			fTitle, fBody, fLabels, fast := extractIssueFields(body)
+			if fast {
+				titleText, bodyText, labelNames = fTitle, fBody, fLabels
+				for _, ln := range labelNames {
 					s.st.mu.RLock()
 					_, exists := rp.labels[ln]
 					s.st.mu.RUnlock()
@@ -643,23 +629,58 @@ func (s *server) handleIssues(w http.ResponseWriter, r *http.Request, rp *repo, 
 						s.sendErr(w, 422, "Label does not exist: "+ln, nil)
 						return true
 					}
-					labelNames = append(labelNames, ln)
 				}
+			} else {
+				parsed, ok := jsonBody(method, body)
+				if !ok {
+					return badJSON()
+				}
+				if raw, isArr := parsed["labels"].([]any); isArr {
+					for _, l := range raw {
+						var ln string
+						var isLabel bool
+						switch t := l.(type) {
+						case string:
+							ln, isLabel = t, true
+						case map[string]any:
+							if n, isStr := t["name"].(string); isStr {
+								ln, isLabel = n, true
+							}
+						}
+						if !isLabel {
+							continue
+						}
+						s.st.mu.RLock()
+						_, exists := rp.labels[ln]
+						s.st.mu.RUnlock()
+						if !exists {
+							s.sendErr(w, 422, "Label does not exist: "+ln, nil)
+							return true
+						}
+						labelNames = append(labelNames, ln)
+					}
+				}
+				titleText = jsStr(getField(parsed, "title"))
+				bodyText = jsStr(getField(parsed, "body"))
 			}
 			s.st.mu.Lock()
 			number := rp.nextNumber
 			rp.nextNumber++
 			sec := tick()
 			iss := &issue{
-				id: nextEntityID(), number: number, title: jsStr(getField(parsed, "title")),
-				body: jsStr(getField(parsed, "body")), state: "open", labels: labelNames,
+				id: nextEntityID(), number: number, title: titleText,
+				body: bodyText, state: "open", labels: labelNames,
 				seq: number, createdAt: isoOf(sec), updatedAt: isoOf(sec), comments: []*comment{},
+				nodeID: gid("issue", viewerLogin+"/"+name+":"+strconv.Itoa(number)),
 			}
 			rp.issues[number] = iss
 			rp.issuesOrder = append(rp.issuesOrder, iss)
-			j := s.issueJSON(rp, iss)
+			jb := appendIssueJSON(nil, rp, iss)
+			cp := new([]byte)
+			*cp = jb
+			iss.cached.Store(cp)
 			s.st.mu.Unlock()
-			s.sendJSON(w, 201, j, nil)
+			s.sendJSONBytes(w, 201, jb, nil)
 			return true
 		}
 		s.sendErr(w, 404, "Not Found", nil)
@@ -679,9 +700,17 @@ func (s *server) handleIssues(w http.ResponseWriter, r *http.Request, rp *repo, 
 				s.sendErr(w, 404, "Not Found", nil)
 				return true
 			}
-			j := s.issueJSON(rp, iss)
+			if cp := iss.cached.Load(); cp != nil {
+				s.st.mu.RUnlock()
+				s.sendJSONBytes(w, 200, *cp, nil)
+				return true
+			}
+			jb := appendIssueJSON(nil, rp, iss)
+			cp2 := new([]byte)
+			*cp2 = jb
+			iss.cached.Store(cp2)
 			s.st.mu.RUnlock()
-			s.sendJSON(w, 200, j, nil)
+			s.sendJSONBytes(w, 200, jb, nil)
 			return true
 		}
 		if method == "PATCH" {
@@ -706,6 +735,7 @@ func (s *server) handleIssues(w http.ResponseWriter, r *http.Request, rp *repo, 
 				iss.body = v
 			}
 			iss.updatedAt = nowIso()
+			iss.invalidateJSON()
 			j := s.issueJSON(rp, iss)
 			s.st.mu.Unlock()
 			s.sendJSON(w, 200, j, nil)
@@ -749,6 +779,7 @@ func (s *server) handleIssues(w http.ResponseWriter, r *http.Request, rp *repo, 
 			}
 			c := &comment{id: nextEntityID(), body: jsStr(getField(parsed, "body")), createdAt: nowIso()}
 			iss.comments = append(iss.comments, c)
+			iss.invalidateJSON()
 			resp := map[string]any{
 				"id": c.id, "node_id": gid("comment", viewerLogin+"/"+name+":"+strconv.Itoa(num)+":"+strconv.FormatInt(c.id, 10)),
 				"body": c.body, "user": map[string]any{"login": viewerLogin, "id": viewerID},
@@ -765,7 +796,7 @@ func (s *server) handleIssues(w http.ResponseWriter, r *http.Request, rp *repo, 
 	return true
 }
 
-func (s *server) handlePulls(w http.ResponseWriter, r *http.Request, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
+func (s *server) handlePulls(w *fastResp, r *fastReq, rp *repo, owner, name string, tail []string, q *queryParams, body []byte, method string, badJSON func() bool) bool {
 	if len(tail) == 1 {
 		if method == "GET" {
 			s.st.mu.RLock()
@@ -785,7 +816,7 @@ func (s *server) handlePulls(w http.ResponseWriter, r *http.Request, rp *repo, o
 				jsonList = append(jsonList, s.pullJSON(rp, p))
 			}
 			s.st.mu.RUnlock()
-			page, link := paginate(jsonList, q, r.Host, "/api/v3/repos/"+owner+"/"+name+"/pulls")
+			page, link := paginate(jsonList, q, r.host, "/api/v3/repos/"+owner+"/"+name+"/pulls")
 			s.sendJSON(w, 200, page, linkHeader(link))
 			return true
 		}

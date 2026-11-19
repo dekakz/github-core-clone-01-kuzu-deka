@@ -3,7 +3,6 @@
 package main
 
 import (
-	"net/http"
 	"strconv"
 	"strings"
 )
@@ -126,6 +125,7 @@ func (s *server) mcpCallTool(name string, args map[string]any) map[string]any {
 			id: nextEntityID(), number: number, title: jsStr(args["title"]), body: body,
 			state: "open", labels: []string{}, seq: number,
 			createdAt: isoOf(sec), updatedAt: isoOf(sec), comments: []*comment{},
+			nodeID: gid("issue", viewerLogin+"/"+rp.name+":"+strconv.Itoa(number)),
 		}
 		rp.issues[number] = iss
 		rp.issuesOrder = append(rp.issuesOrder, iss)
@@ -241,11 +241,11 @@ func (s *server) mcpCallTool(name string, args map[string]any) map[string]any {
 	}
 }
 
-func (s *server) handleMcp(w http.ResponseWriter, r *http.Request, body []byte) {
+func (s *server) handleMcp(w *fastResp, r *fastReq, body []byte) {
 	sendRpc := func(status int, payload any) {
 		s.sendJSON(w, status, payload, nil)
 	}
-	if r.Method == "DELETE" {
+	if r.method == "DELETE" {
 		sendRpc(200, map[string]any{})
 		return
 	}

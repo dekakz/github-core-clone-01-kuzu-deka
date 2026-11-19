@@ -5,13 +5,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"math"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 const jsonType = "application/json; charset=utf-8"
@@ -22,6 +21,121 @@ type server struct {
 }
 
 var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// appendJSONString appends s as a JSON string, byte-compatible with
+// encoding/json with SetEscapeHTML(false): only ", \, control chars and
+// U+2028/U+2029 are escaped; <, > and & stay raw; invalid UTF-8 becomes \ufffd.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			if c >= 0x20 && c != '"' && c != '\\' {
+				i++
+				continue
+			}
+			if start < i {
+				dst = append(dst, s[start:i]...)
+			}
+			switch c {
+			case '"':
+				dst = append(dst, '\\', '"')
+			case '\\':
+				dst = append(dst, '\\', '\\')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			default:
+				const hexd = "0123456789abcdef"
+				dst = append(dst, '\\', 'u', '0', '0', hexd[c>>4], hexd[c&0xf])
+			}
+			i++
+			start = i
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			if start < i {
+				dst = append(dst, s[start:i]...)
+			}
+			dst = append(dst, '\\', 'u', 'f', 'f', 'f', 'd')
+			i++
+			start = i
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			if start < i {
+				dst = append(dst, s[start:i]...)
+			}
+			dst = append(dst, '\\', 'u', '2', '0', '2', '8')
+			if r == '\u2029' {
+				dst[len(dst)-1] = '9'
+			}
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	if start < len(s) {
+		dst = append(dst, s[start:]...)
+	}
+	return append(dst, '"')
+}
+
+// appendIssueJSON renders an issue exactly as encoding/json would render the
+// issueJSON struct (same field order, same values), without reflection.
+func appendIssueJSON(dst []byte, r *repo, i *issue) []byte {
+	dst = append(dst, `{"id":`...)
+	dst = strconv.AppendInt(dst, i.id, 10)
+	dst = append(dst, `,"node_id":`...)
+	dst = appendJSONString(dst, i.nodeID)
+	dst = append(dst, `,"number":`...)
+	dst = strconv.AppendInt(dst, int64(i.number), 10)
+	dst = append(dst, `,"title":`...)
+	dst = appendJSONString(dst, i.title)
+	dst = append(dst, `,"body":`...)
+	dst = appendJSONString(dst, i.body)
+	dst = append(dst, `,"state":`...)
+	dst = appendJSONString(dst, i.state)
+	dst = append(dst, `,"user":{"login":`...)
+	dst = appendJSONString(dst, viewerLogin)
+	dst = append(dst, `,"id":`...)
+	dst = strconv.AppendInt(dst, viewerID, 10)
+	dst = append(dst, `,"type":"User"},"labels":[`...)
+	for idx, n := range i.labels {
+		if idx > 0 {
+			dst = append(dst, ',')
+		}
+		color := "ededed"
+		if l, ok := r.labels[n]; ok {
+			color = l.color
+		}
+		dst = append(dst, `{"name":`...)
+		dst = appendJSONString(dst, n)
+		dst = append(dst, `,"color":`...)
+		dst = appendJSONString(dst, color)
+		dst = append(dst, '}')
+	}
+	dst = append(dst, `],"assignee":null,"assignees":[],"milestone":null,"locked":false,"comments":`...)
+	dst = strconv.AppendInt(dst, int64(len(i.comments)), 10)
+	dst = append(dst, `,"created_at":`...)
+	dst = appendJSONString(dst, i.createdAt)
+	dst = append(dst, `,"updated_at":`...)
+	dst = appendJSONString(dst, i.updatedAt)
+	dst = append(dst, `,"closed_at":`...)
+	if i.state == "closed" {
+		dst = appendJSONString(dst, i.updatedAt)
+	} else {
+		dst = append(dst, "null"...)
+	}
+	dst = append(dst, `,"author_association":"OWNER","html_url":"","url":"","repository_url":"","labels_url":"","comments_url":""}`...)
+	return dst
+}
 
 // marshalJSON renders v as JSON without HTML escaping, no trailing newline.
 func marshalJSON(v any) []byte {
@@ -40,16 +154,21 @@ func marshalJSON(v any) []byte {
 	return out
 }
 
-func (s *server) sendJSON(w http.ResponseWriter, status int, body any, extra map[string]string) {
+func setHeader(h fastHeader, k, v string) {
+	// Direct map assignment: Header.Set would re-canonicalize the key.
+	h[k] = v
+}
+
+func (s *server) sendJSON(w *fastResp, status int, body any, extra map[string]string) {
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(body)
 	h := w.Header()
-	h.Set("Content-Type", jsonType)
-	h.Set("Content-Length", strconv.Itoa(buf.Len()))
-	h.Set("X-Github-Request-Id", nextReqID())
+	setHeader(h, "Content-Type", jsonType)
+	setHeader(h, "Content-Length", strconv.Itoa(buf.Len()))
+	setHeader(h, "X-Github-Request-Id", nextReqID())
 	for k, v := range extra {
 		h.Set(k, v)
 	}
@@ -58,16 +177,29 @@ func (s *server) sendJSON(w http.ResponseWriter, status int, body any, extra map
 	bufPool.Put(buf)
 }
 
-func (s *server) sendErr(w http.ResponseWriter, status int, message string, extra map[string]string) {
+// sendJSONBytes writes a pre-encoded JSON body: no encode, no copy.
+func (s *server) sendJSONBytes(w *fastResp, status int, b []byte, extra map[string]string) {
+	h := w.Header()
+	setHeader(h, "Content-Type", jsonType)
+	setHeader(h, "Content-Length", strconv.Itoa(len(b)))
+	setHeader(h, "X-Github-Request-Id", nextReqID())
+	for k, v := range extra {
+		h.Set(k, v)
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(b)
+}
+
+func (s *server) sendErr(w *fastResp, status int, message string, extra map[string]string) {
 	s.sendJSON(w, status, map[string]any{"message": message}, extra)
 }
 
-func (s *server) sendBytes(w http.ResponseWriter, status int, contentType string, body []byte, extra map[string]string, withReqID bool) {
+func (s *server) sendBytes(w *fastResp, status int, contentType string, body []byte, extra map[string]string, withReqID bool) {
 	h := w.Header()
-	h.Set("Content-Type", contentType)
-	h.Set("Content-Length", strconv.Itoa(len(body)))
+	setHeader(h, "Content-Type", contentType)
+	setHeader(h, "Content-Length", strconv.Itoa(len(body)))
 	if withReqID {
-		h.Set("X-Github-Request-Id", nextReqID())
+		setHeader(h, "X-Github-Request-Id", nextReqID())
 	}
 	for k, v := range extra {
 		h.Set(k, v)
@@ -76,31 +208,17 @@ func (s *server) sendBytes(w http.ResponseWriter, status int, contentType string
 	_, _ = w.Write(body)
 }
 
-func readBody(r *http.Request) ([]byte, error) {
-	if r.Body == nil {
-		return []byte{}, nil
-	}
-	b, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(b) > maxBodyBytes {
-		return nil, errBodyTooLarge
-	}
-	return b, nil
-}
-
 var errBodyTooLarge = &bodyTooLargeError{}
 
 type bodyTooLargeError struct{}
 
 func (e *bodyTooLargeError) Error() string { return "body too large" }
 
-func isAuthed(r *http.Request) bool {
-	if token == "" {
+func isAuthed(r *fastReq) bool {
+	if bearerToken == "" {
 		return true
 	}
-	return r.Header.Get("Authorization") == "Bearer "+token
+	return r.header("authorization") == bearerToken
 }
 
 func decodePath(p string) string {
@@ -111,6 +229,7 @@ func decodePath(p string) string {
 }
 
 // splitPath splits a request path into decoded segments, dropping empties.
+// Segments without '%' are returned as-is: PathUnescape would only copy them.
 func splitPath(path string) []string {
 	raw := strings.Split(path, "/")
 	out := make([]string, 0, len(raw))
@@ -118,7 +237,10 @@ func splitPath(path string) []string {
 		if seg == "" {
 			continue
 		}
-		out = append(out, decodePath(seg))
+		if strings.Contains(seg, "%") {
+			seg = decodePath(seg)
+		}
+		out = append(out, seg)
 	}
 	return out
 }
@@ -226,6 +348,274 @@ func (q *queryParams) clone() *queryParams {
 }
 
 // ------------------------------------------------------------------ JSON body / JS value helpers
+
+// extractIssueFields parses a POST /issues body of the form
+// {"title": "...", "body": "...", "labels": ["a", {"name": "b"}]}
+// without reflection. Anything else (unknown keys, non-string values,
+// malformed JSON) returns ok=false and the caller falls back to jsonBody,
+// so behaviour is identical to the generic path for exotic requests.
+func extractIssueFields(body []byte) (title, bodyText string, labels []string, ok bool) {
+	p := &jsonScanner{b: body}
+	p.ws()
+	if !p.byte('{') {
+		return "", "", nil, false
+	}
+	p.ws()
+	if p.byte('}') {
+		p.ws()
+		return "", "", nil, p.eof()
+	}
+	for {
+		p.ws()
+		key, good := p.str()
+		if !good {
+			return "", "", nil, false
+		}
+		p.ws()
+		if !p.byte(':') {
+			return "", "", nil, false
+		}
+		p.ws()
+		switch key {
+		case "title", "body":
+			v, good := p.value()
+			if !good {
+				return "", "", nil, false
+			}
+			if key == "title" {
+				title = v
+			} else {
+				bodyText = v
+			}
+		case "labels":
+			ls, good := p.labels()
+			if !good {
+				return "", "", nil, false
+			}
+			labels = ls
+		default:
+			return "", "", nil, false
+		}
+		p.ws()
+		if p.byte(',') {
+			continue
+		}
+		if p.byte('}') {
+			p.ws()
+			return title, bodyText, labels, p.eof()
+		}
+		return "", "", nil, false
+	}
+}
+
+type jsonScanner struct {
+	b []byte
+	i int
+}
+
+func (p *jsonScanner) ws() {
+	for p.i < len(p.b) {
+		switch p.b[p.i] {
+		case ' ', '\t', '\n', '\r':
+			p.i++
+		default:
+			return
+		}
+	}
+}
+
+func (p *jsonScanner) eof() bool { return p.i == len(p.b) }
+
+func (p *jsonScanner) byte(c byte) bool {
+	if p.i < len(p.b) && p.b[p.i] == c {
+		p.i++
+		return true
+	}
+	return false
+}
+
+// str parses a JSON string starting at the current position.
+func (p *jsonScanner) str() (string, bool) {
+	if p.i >= len(p.b) || p.b[p.i] != '"' {
+		return "", false
+	}
+	p.i++
+	start := p.i
+	for p.i < len(p.b) {
+		c := p.b[p.i]
+		if c == '"' {
+			s := string(p.b[start:p.i])
+			p.i++
+			return s, true
+		}
+		if c == '\\' {
+			return p.strEscaped(start)
+		}
+		if c < 0x20 {
+			return "", false
+		}
+		p.i++
+	}
+	return "", false
+}
+
+func (p *jsonScanner) strEscaped(start int) (string, bool) {
+	var sb strings.Builder
+	sb.Write(p.b[start : p.i-1])
+	for p.i < len(p.b) {
+		c := p.b[p.i]
+		if c == '"' {
+			p.i++
+			return sb.String(), true
+		}
+		if c != '\\' {
+			if c < 0x20 {
+				return "", false
+			}
+			sb.WriteByte(c)
+			p.i++
+			continue
+		}
+		p.i++
+		if p.i >= len(p.b) {
+			return "", false
+		}
+		switch e := p.b[p.i]; e {
+		case '"':
+			sb.WriteByte('"')
+		case '\\':
+			sb.WriteByte('\\')
+		case '/':
+			sb.WriteByte('/')
+		case 'b':
+			sb.WriteByte('\b')
+		case 'f':
+			sb.WriteByte('\f')
+		case 'n':
+			sb.WriteByte('\n')
+		case 'r':
+			sb.WriteByte('\r')
+		case 't':
+			sb.WriteByte('\t')
+		case 'u':
+			r, good := p.hex4()
+			if !good {
+				return "", false
+			}
+			if r >= 0xD800 && r <= 0xDBFF {
+				if p.i+1 < len(p.b) && p.b[p.i] == '\\' && p.b[p.i+1] == 'u' {
+					save := p.i
+					p.i += 2
+					r2, good2 := p.hex4()
+					if good2 && r2 >= 0xDC00 && r2 <= 0xDFFF {
+						r = 0x10000 + (r-0xD800)<<10 + (r2 - 0xDC00)
+					} else {
+						p.i = save
+						sb.WriteRune(0xFFFD)
+						continue
+					}
+				} else {
+					sb.WriteRune(0xFFFD)
+					continue
+				}
+			}
+			sb.WriteRune(rune(r))
+		default:
+			return "", false
+		}
+		p.i++
+	}
+	return "", false
+}
+
+func (p *jsonScanner) hex4() (int, bool) {
+	if p.i+4 > len(p.b) {
+		return 0, false
+	}
+	n := 0
+	for k := 0; k < 4; k++ {
+		c := p.b[p.i+k]
+		n <<= 4
+		switch {
+		case c >= '0' && c <= '9':
+			n += int(c - '0')
+		case c >= 'a' && c <= 'f':
+			n += int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			n += int(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	p.i += 4
+	return n, true
+}
+
+// value parses a JSON string or null (the only shapes title/body take here).
+func (p *jsonScanner) value() (string, bool) {
+	if p.i+4 <= len(p.b) && string(p.b[p.i:p.i+4]) == "null" {
+		p.i += 4
+		return "", true
+	}
+	return p.str()
+}
+
+// labels parses a JSON array of strings or {"name": "..."} objects, or null.
+func (p *jsonScanner) labels() ([]string, bool) {
+	if p.i+4 <= len(p.b) && string(p.b[p.i:p.i+4]) == "null" {
+		p.i += 4
+		return nil, true
+	}
+	if !p.byte('[') {
+		return nil, false
+	}
+	var out []string
+	p.ws()
+	if p.byte(']') {
+		return out, true
+	}
+	for {
+		p.ws()
+		if p.i < len(p.b) && p.b[p.i] == '"' {
+			s, good := p.str()
+			if !good {
+				return nil, false
+			}
+			out = append(out, s)
+		} else if p.i < len(p.b) && p.b[p.i] == '{' {
+			p.i++
+			p.ws()
+			name, good := p.str()
+			if !good || name != "name" {
+				return nil, false
+			}
+			p.ws()
+			if !p.byte(':') {
+				return nil, false
+			}
+			p.ws()
+			s, good := p.str()
+			if !good {
+				return nil, false
+			}
+			out = append(out, s)
+			p.ws()
+			if !p.byte('}') {
+				return nil, false
+			}
+		} else {
+			return nil, false
+		}
+		p.ws()
+		if p.byte(',') {
+			continue
+		}
+		if p.byte(']') {
+			return out, true
+		}
+		return nil, false
+	}
+}
 
 // jsonBody mirrors the Node jsonBody helper: GET (or an empty DELETE body)
 // yields {}, a malformed body fails, a non-object JSON value yields {}.
@@ -484,8 +874,12 @@ func (s *server) issueJSON(r *repo, i *issue) issueJSON {
 	if i.state == "closed" {
 		closedAt = i.updatedAt
 	}
+	nodeID := i.nodeID
+	if nodeID == "" {
+		nodeID = gid("issue", viewerLogin+"/"+r.name+":"+strconv.Itoa(i.number))
+	}
 	return issueJSON{
-		ID: i.id, NodeID: gid("issue", viewerLogin+"/"+r.name+":"+strconv.Itoa(i.number)),
+		ID: i.id, NodeID: nodeID,
 		Number: i.number, Title: i.title, Body: i.body, State: i.state,
 		User: userRefJSON{Login: viewerLogin, ID: viewerID, Type: "User"},
 		Labels: labels, Assignee: nil, Assignees: []any{}, Milestone: nil, Locked: false,

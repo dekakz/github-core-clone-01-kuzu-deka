@@ -128,6 +128,9 @@ func writePackObjectHeader(typ objType, size int) []byte {
 type packObj struct {
 	typ  objType
 	data []byte
+	// oid is the object's id when already computed (readPack fills it in);
+	// empty when unknown (writePack callers do not need it).
+	oid string
 }
 
 func writePack(list []packObj) []byte {
@@ -260,7 +263,7 @@ func readPack(pack []byte, s *store) ([]packObj, error) {
 	count := int(binary.BigEndian.Uint32(pack[8:12]))
 	trailerStart := len(pack) - 20
 	var raw []*rawPackEntry
-	byOffset := make(map[int]*rawPackEntry)
+	hasDelta := false
 	off := 12
 	for i := 0; i < count; i++ {
 		entryOffset := off
@@ -268,6 +271,9 @@ func readPack(pack []byte, s *store) ([]packObj, error) {
 		off = next
 		tc := (first >> 4) & 0x07
 		entry := &rawPackEntry{offset: entryOffset, typeCode: tc, size: size}
+		if tc == 6 || tc == 7 {
+			hasDelta = true
+		}
 		if tc == 6 {
 			b := pack[off]
 			off++
@@ -302,7 +308,21 @@ func readPack(pack []byte, s *store) ([]packObj, error) {
 		entry.data = inflated
 		off = trailerStart - br.Len()
 		raw = append(raw, entry)
-		byOffset[entryOffset] = entry
+	}
+	if !hasDelta {
+		// Fast path (the bench packs and most pushes): no deltas, so no
+		// resolve maps and no second SHA-1. Hash each object once here;
+		// handleReceivePack stores it without re-hashing or copying.
+		out := make([]packObj, 0, len(raw))
+		for _, e := range raw {
+			t := codeType[e.typeCode]
+			out = append(out, packObj{typ: t, data: e.data, oid: hashObject(t, e.data)})
+		}
+		return out, nil
+	}
+	byOffset := make(map[int]*rawPackEntry, len(raw))
+	for _, e := range raw {
+		byOffset[e.offset] = e
 	}
 	resolved := make(map[int]packObj)
 	byOid := make(map[string]packObj)
@@ -352,8 +372,9 @@ func readPack(pack []byte, s *store) ([]packObj, error) {
 		if err != nil {
 			return packObj{}, err
 		}
+		out.oid = hashObject(out.typ, out.data)
 		resolved[e.offset] = out
-		byOid[hashObject(out.typ, out.data)] = out
+		byOid[out.oid] = out
 		return out, nil
 	}
 	out := make([]packObj, 0, len(raw))

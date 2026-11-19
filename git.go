@@ -91,6 +91,37 @@ func sidebandPack(pack []byte) []byte {
 	return bytes.Join(parts, nil)
 }
 
+// buildFetchResponse renders a complete upload-pack fetch response for one
+// pack and shallow plan, in one buffer. v2 adds the acknowledgments section.
+func buildFetchResponse(pack []byte, plan fetchPlan, isV2 bool, hasShallow bool) []byte {
+	var buf bytes.Buffer
+	if isV2 {
+		buf.Write(pktLine([]byte("acknowledgments\n")))
+		buf.Write(pktLine([]byte("NAK\n")))
+		buf.Write(pktFlush)
+	}
+	if !isV2 {
+		buf.Write(pktLine([]byte("NAK\n")))
+	}
+	if isV2 && hasShallow {
+		buf.Write(pktLine([]byte("shallow-info\n")))
+	}
+	for _, sh := range plan.newShallow {
+		buf.Write(pktLine([]byte("shallow " + sh + "\n")))
+	}
+	for _, sh := range plan.unshallow {
+		buf.Write(pktLine([]byte("unshallow " + sh + "\n")))
+	}
+	if isV2 && hasShallow {
+		buf.Write(pktFlush)
+	}
+	if isV2 {
+		buf.Write(pktLine([]byte("packfile\n")))
+	}
+	buf.Write(sidebandPack(pack))
+	return buf.Bytes()
+}
+
 func (s *store) handleUploadPack(r *repo, body []byte, isV2 bool) ([]byte, error) {
 	packets, err := decodePktLines(body)
 	if err != nil {
@@ -194,36 +225,16 @@ func (s *store) handleUploadPack(r *repo, body []byte, isV2 bool) ([]byte, error
 			r.packCacheMu.Lock()
 			cp, cached := r.packCache[cacheKey]
 			r.packCacheMu.Unlock()
-			var pack []byte
-			var plan fetchPlan
 			if cached {
-				pack = cp.pack
-				plan.newShallow = cp.newShallow
-				plan.unshallow = cp.unshallow
-			} else {
-				plan = s.fetchObjects(r, wants, haves, depth, shallow)
-				pack = writePack(plan.objs)
-				r.packCacheMu.Lock()
-				r.packCache[cacheKey] = cachedPack{pack: pack, newShallow: plan.newShallow, unshallow: plan.unshallow}
-				r.packCacheMu.Unlock()
+				return cp.resp, nil
 			}
-			var parts [][]byte
-			parts = append(parts, pktLine([]byte("acknowledgments\n")))
-			parts = append(parts, pktLine([]byte("NAK\n")))
-			parts = append(parts, pktFlush)
-			if depth != nil || len(shallow) > 0 {
-				parts = append(parts, pktLine([]byte("shallow-info\n")))
-				for _, sh := range plan.newShallow {
-					parts = append(parts, pktLine([]byte("shallow "+sh+"\n")))
-				}
-				for _, sh := range plan.unshallow {
-					parts = append(parts, pktLine([]byte("unshallow "+sh+"\n")))
-				}
-				parts = append(parts, pktFlush)
-			}
-			parts = append(parts, pktLine([]byte("packfile\n")))
-			parts = append(parts, sidebandPack(pack))
-			return bytes.Join(parts, nil), nil
+			plan := s.fetchObjects(r, wants, haves, depth, shallow)
+			pack := writePack(plan.objs)
+			resp := buildFetchResponse(pack, plan, true, depth != nil || len(shallow) > 0)
+			r.packCacheMu.Lock()
+			r.packCache[cacheKey] = cachedPack{pack: pack, newShallow: plan.newShallow, unshallow: plan.unshallow, resp: resp}
+			r.packCacheMu.Unlock()
+			return resp, nil
 		}
 		return nil, errors.New("unknown v2 command")
 	}
@@ -259,29 +270,16 @@ func (s *store) handleUploadPack(r *repo, body []byte, isV2 bool) ([]byte, error
 	r.packCacheMu.Lock()
 	cp, cached := r.packCache[cacheKey]
 	r.packCacheMu.Unlock()
-	var pack []byte
-	var plan fetchPlan
 	if cached {
-		pack = cp.pack
-		plan.newShallow = cp.newShallow
-		plan.unshallow = cp.unshallow
-	} else {
-		plan = s.fetchObjects(r, wants, haves, depth, shallow)
-		pack = writePack(plan.objs)
-		r.packCacheMu.Lock()
-		r.packCache[cacheKey] = cachedPack{pack: pack, newShallow: plan.newShallow, unshallow: plan.unshallow}
-		r.packCacheMu.Unlock()
+		return cp.resp, nil
 	}
-	var parts [][]byte
-	parts = append(parts, pktLine([]byte("NAK\n")))
-	for _, sh := range plan.newShallow {
-		parts = append(parts, pktLine([]byte("shallow "+sh+"\n")))
-	}
-	for _, sh := range plan.unshallow {
-		parts = append(parts, pktLine([]byte("unshallow "+sh+"\n")))
-	}
-	parts = append(parts, sidebandPack(pack))
-	return bytes.Join(parts, nil), nil
+	plan := s.fetchObjects(r, wants, haves, depth, shallow)
+	pack := writePack(plan.objs)
+	resp := buildFetchResponse(pack, plan, false, false)
+	r.packCacheMu.Lock()
+	r.packCache[cacheKey] = cachedPack{pack: pack, newShallow: plan.newShallow, unshallow: plan.unshallow, resp: resp}
+	r.packCacheMu.Unlock()
+	return resp, nil
 }
 
 type pushCommand struct {
@@ -330,7 +328,7 @@ func (s *store) handleReceivePack(r *repo, body []byte) ([]byte, error) {
 			unpackDetail = err.Error()
 		} else {
 			for _, o := range objs {
-				s.putObject(o.typ, o.data)
+				s.putObjectOID(o.typ, o.data, o.oid)
 			}
 		}
 	}
