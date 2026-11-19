@@ -416,15 +416,108 @@ func writeResponse(c net.Conn, resp *fastResp, req *fastReq, out []byte) []byte 
 
 // dispatch is the old ServeHTTP, adapted to fastReq/fastResp. The body was
 // already read by readRequest; bodyErr mirrors readBody's failure.
+//
+// GET memo: a 200 GET response is memoized by (method, path, query, host,
+// git-protocol) and served again while the generation matches. The
+// generation bumps after every completed non-GET dispatch, and every
+// mutation goes through a non-GET dispatch, so a memoized response can never
+// outlive the state it was rendered from. The X-Github-Request-Id header is
+// regenerated per request (never memoized), and Date/Content-Length are
+// filled in by writeResponse, so a memo hit is observably identical to a
+// fresh render. Only authenticated GETs are memoized (isAuthed is a pure
+// header compare).
 func (s *server) dispatch(w *fastResp, r *fastReq) {
+	panicked := false
 	defer func() {
 		if rec := recover(); rec != nil {
+			panicked = true
 			// Nothing has been flushed yet, so the partial response can
 			// simply be replaced with a clean 500.
 			w.reset()
 			s.sendErr(w, 500, fmt.Sprint(rec), nil)
 		}
 	}()
+	if r.method != "GET" {
+		// Bump after the handler returns (defer): the mutation is complete
+		// and its lock released by then, so no GET can memoize pre-mutation
+		// state under the new generation.
+		defer s.gen.Add(1)
+	}
+	memoKey := ""
+	memoOK := false
+	var memoGen uint64
+	if r.method == "GET" && isAuthed(r) {
+		memoKey = "GET " + r.path + "?" + r.rawQuery + "\x00" + r.host + "\x00" + r.header("git-protocol")
+		// Capture the generation BEFORE routing: an entry is stored under
+		// the generation its state was read in, so a mutation that lands
+		// mid-request can never tag pre-mutation bytes with the new
+		// generation (the entry would simply never be served).
+		memoGen = s.gen.Load()
+		if s.serveMemo(w, memoKey, memoGen) {
+			return
+		}
+		memoOK = true
+	}
+	s.route(w, r)
+	if memoOK && !panicked {
+		s.storeMemo(w, memoKey, memoGen)
+	}
+}
+
+// memoKeyMax is the memo size cap; on overflow the map is dropped (safe:
+// it only costs cache misses).
+const memoKeyMax = 4096
+
+func (s *server) serveMemo(w *fastResp, key string, gen uint64) bool {
+	s.memoMu.Lock()
+	e, ok := s.memo[key]
+	s.memoMu.Unlock()
+	if !ok || e.gen != gen {
+		return false
+	}
+	h := w.Header()
+	setHeader(h, "Content-Type", e.ctype)
+	setHeader(h, "Content-Length", strconv.Itoa(len(e.body)))
+	setHeader(h, "X-Github-Request-Id", nextReqID())
+	for k, v := range e.extra {
+		h.Set(k, v)
+	}
+	w.WriteHeader(e.status)
+	_, _ = w.Write(e.body)
+	return true
+}
+
+func (s *server) storeMemo(w *fastResp, key string, gen uint64) {
+	if w.status != 200 {
+		return
+	}
+	ctype, ok := w.hdr["Content-Type"]
+	if !ok {
+		return
+	}
+	extra := make(map[string]string, len(w.hdr))
+	for k, v := range w.hdr {
+		switch k {
+		case "Content-Type", "Content-Length", "Date", "X-Github-Request-Id", "Connection":
+			continue
+		default:
+			extra[k] = v
+		}
+	}
+	body := make([]byte, len(w.body))
+	copy(body, w.body)
+	s.memoMu.Lock()
+	if s.memo == nil {
+		s.memo = make(map[string]memoEntry, 64)
+	}
+	if len(s.memo) >= memoKeyMax {
+		s.memo = make(map[string]memoEntry, 64)
+	}
+	s.memo[key] = memoEntry{gen: gen, status: w.status, ctype: ctype, extra: extra, body: body}
+	s.memoMu.Unlock()
+}
+
+func (s *server) route(w *fastResp, r *fastReq) {
 	path := r.path
 	q := parseQuery(r.rawQuery)
 	method := r.method

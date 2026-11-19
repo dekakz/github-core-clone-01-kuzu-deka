@@ -98,6 +98,23 @@ const (
 type gitObj struct {
 	typ  objType
 	data []byte
+	// comp caches the object's zlib-compressed bytes (BestSpeed), computed
+	// once on first use: a fetch serves these as-is instead of
+	// re-compressing the object for every clone. The bytes are immutable
+	// once published, so sharing them across responses is safe.
+	comp     []byte
+	compOnce sync.Once
+}
+
+// compressed returns the object's zlib-compressed bytes, computing and
+// caching them on first call. The stream is a valid zlib stream at any
+// level; BestSpeed is chosen because a fetch only needs the bytes to
+// inflate correctly, and level 1 costs ~2-3x less CPU than default.
+func (o *gitObj) compressed() []byte {
+	o.compOnce.Do(func() {
+		o.comp = compressObject(o.data)
+	})
+	return o.comp
 }
 
 func hashObject(typ objType, data []byte) string {

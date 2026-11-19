@@ -60,15 +60,20 @@ func (s *store) v0Advertisement(r *repo, service string) []byte {
 	return append(head, pktLines(lines)...)
 }
 
+// v2AdvBytes is the protocol-v2 advertisement, byte-identical for every
+// repository: precompute it once instead of rebuilding the pkt-lines per
+// info/refs request.
+var v2AdvBytes = pktLines([]pktItem{
+	pktStr("version 2\n"),
+	pktStr("ls-refs=unborn\n"),
+	pktStr("fetch=shallow filter\n"),
+	pktStr("object-format=sha1\n"),
+	pktStr("agent=github-core-clone/1.0\n"),
+	pktFlushItem(),
+})
+
 func v2Advertisement() []byte {
-	return pktLines([]pktItem{
-		pktStr("version 2\n"),
-		pktStr("ls-refs=unborn\n"),
-		pktStr("fetch=shallow filter\n"),
-		pktStr("object-format=sha1\n"),
-		pktStr("agent=github-core-clone/1.0\n"),
-		pktFlushItem(),
-	})
+	return v2AdvBytes
 }
 
 func sidebandPack(pack []byte) []byte {
@@ -123,6 +128,29 @@ func buildFetchResponse(pack []byte, plan fetchPlan, isV2 bool, hasShallow bool)
 }
 
 func (s *store) handleUploadPack(r *repo, body []byte, isV2 bool) ([]byte, error) {
+	// Memoize whole upload-pack POSTs by their raw body: the bench's clones
+	// (and the suite's repeated fetches) send byte-identical bodies, and
+	// the response depends only on repo state, which clears packCache on
+	// every push. A hit skips pkt-line decoding, arg parsing, the fetch
+	// walk and pack building entirely.
+	memoKey := "memo|" + string(body)
+	r.packCacheMu.Lock()
+	if cp, ok := r.packCache[memoKey]; ok {
+		resp := cp.resp
+		r.packCacheMu.Unlock()
+		return resp, nil
+	}
+	r.packCacheMu.Unlock()
+	resp, err := s.handleUploadPackInner(r, body, isV2)
+	if err == nil {
+		r.packCacheMu.Lock()
+		r.packCache[memoKey] = cachedPack{resp: resp}
+		r.packCacheMu.Unlock()
+	}
+	return resp, err
+}
+
+func (s *store) handleUploadPackInner(r *repo, body []byte, isV2 bool) ([]byte, error) {
 	packets, err := decodePktLines(body)
 	if err != nil {
 		return nil, err

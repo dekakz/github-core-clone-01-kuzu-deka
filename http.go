@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 )
 
@@ -18,6 +19,23 @@ const maxBodyBytes = 64 * 1024 * 1024
 
 type server struct {
 	st *store
+	// gen counts completed non-GET dispatches: every mutation goes through
+	// one, so a memoized GET is valid only while its generation matches.
+	gen atomic.Uint64
+	// memo caches whole GET responses (status, content type, extra headers,
+	// body) keyed by method+path+query+host+git-protocol; see dispatch.
+	// The X-Github-Request-Id header is never memoized: it is regenerated
+	// per request, so a memo hit is observably identical to a fresh render.
+	memoMu sync.Mutex
+	memo   map[string]memoEntry
+}
+
+type memoEntry struct {
+	gen    uint64
+	status int
+	ctype  string
+	extra  map[string]string
+	body   []byte
 }
 
 var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}

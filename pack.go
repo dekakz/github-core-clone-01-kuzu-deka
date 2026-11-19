@@ -12,7 +12,43 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 )
+
+// zlibReader is the Reset method on compress/zlib's reader: a pooled reader
+// can be reset onto a new stream instead of allocating a fresh decompressor
+// (huffman tables, dictionaries) per pack entry.
+type zlibReader interface {
+	io.ReadCloser
+	Reset(r io.Reader, dict []byte) error
+}
+
+var zlibReaderPool sync.Pool // holds zlibReader; empty when cold
+
+// getZlibReader returns a pooled zlib reader reset onto br, or a fresh one.
+func getZlibReader(br *bytes.Reader) (zlibReader, error) {
+	if v := zlibReaderPool.Get(); v != nil {
+		if zr, ok := v.(zlibReader); ok {
+			if err := zr.Reset(br, nil); err == nil {
+				return zr, nil
+			}
+			// Reset failed: drop it and fall through to a fresh reader.
+		}
+	}
+	r, err := zlib.NewReader(br)
+	if err != nil {
+		return nil, err
+	}
+	zr, ok := r.(zlibReader)
+	if !ok {
+		return nil, errors.New("zlib reader has no Reset")
+	}
+	return zr, nil
+}
+
+func putZlibReader(zr zlibReader) {
+	zlibReaderPool.Put(zr)
+}
 
 // ------------------------------------------------------------------ pkt-lines
 
@@ -131,6 +167,21 @@ type packObj struct {
 	// oid is the object's id when already computed (readPack fills it in);
 	// empty when unknown (writePack callers do not need it).
 	oid string
+	// comp holds the object's zlib-compressed bytes when already computed
+	// (fetchObjects fills it from the store's per-object cache); writePack
+	// serves these as-is instead of re-compressing per clone.
+	comp []byte
+}
+
+// compressObject deflates data once with BestSpeed: the pack bytes only have
+// to be a valid zlib stream, and level 1 is ~2-3x cheaper than default for
+// the small objects in a fetch, for a slightly larger pack.
+func compressObject(data []byte) []byte {
+	var zb bytes.Buffer
+	zw, _ := zlib.NewWriterLevel(&zb, zlib.BestSpeed)
+	zw.Write(data)
+	zw.Close()
+	return zb.Bytes()
 }
 
 func writePack(list []packObj) []byte {
@@ -142,11 +193,11 @@ func writePack(list []packObj) []byte {
 	body.Write(hdr[:])
 	for _, o := range list {
 		body.Write(writePackObjectHeader(o.typ, len(o.data)))
-		var zb bytes.Buffer
-		zw := zlib.NewWriter(&zb)
-		zw.Write(o.data)
-		zw.Close()
-		body.Write(zb.Bytes())
+		if o.comp != nil {
+			body.Write(o.comp)
+			continue
+		}
+		body.Write(compressObject(o.data))
 	}
 	sum := sha1.Sum(body.Bytes())
 	out := make([]byte, 0, body.Len()+20)
@@ -291,20 +342,32 @@ func readPack(pack []byte, s *store) ([]packObj, error) {
 			return nil, fmt.Errorf("unknown pack type %d", tc)
 		}
 		// Inflate exactly one zlib stream starting at off; bytes.Reader tracks
-		// the consumed bytes so off lands on the next entry.
+		// the consumed bytes so off lands on the next entry. The reader is
+		// pooled (a fresh flate decompressor per entry is pure allocation)
+		// and the output is allocated at its exact declared size: the entry
+		// header already states the inflated length, so no growth copies.
 		br := bytes.NewReader(pack[off:trailerStart])
-		zr, err := zlib.NewReader(br)
+		zr, err := getZlibReader(br)
 		if err != nil {
 			return nil, err
 		}
-		inflated, err := io.ReadAll(zr)
-		zr.Close()
-		if err != nil {
+		inflated := make([]byte, size)
+		if _, err := io.ReadFull(zr, inflated); err != nil {
+			putZlibReader(zr)
 			return nil, err
 		}
-		if len(inflated) != size {
-			return nil, errors.New("pack entry size mismatch")
+		// The stream must end exactly here: one more byte means the entry
+		// is longer than declared; EOF (after the checksum trailer is
+		// verified) means it matches.
+		var one [1]byte
+		if _, err := zr.Read(one[:]); err != io.EOF {
+			putZlibReader(zr)
+			if err == nil {
+				return nil, errors.New("pack entry size mismatch")
+			}
+			return nil, err
 		}
+		putZlibReader(zr)
 		entry.data = inflated
 		off = trailerStart - br.Len()
 		raw = append(raw, entry)
@@ -527,7 +590,10 @@ func (s *store) fetchObjects(r *repo, wants, haves []string, depth *int, shallow
 			continue
 		}
 		if obj := s.objects[oid]; obj != nil {
-			objs = append(objs, packObj{typ: obj.typ, data: obj.data})
+			// The oid is the map key: carry it so the sort below compares
+			// strings instead of re-hashing every object's bytes O(n log n)
+			// times, and so writePack can serve pre-compressed bytes.
+			objs = append(objs, packObj{typ: obj.typ, data: obj.data, oid: oid, comp: obj.compressed()})
 		}
 	}
 	rank := func(t objType) int {
@@ -546,7 +612,7 @@ func (s *store) fetchObjects(r *repo, wants, haves []string, depth *int, shallow
 		if rank(objs[i].typ) != rank(objs[j].typ) {
 			return rank(objs[i].typ) < rank(objs[j].typ)
 		}
-		return hashObject(objs[i].typ, objs[i].data) < hashObject(objs[j].typ, objs[j].data)
+		return objs[i].oid < objs[j].oid
 	})
 	newShallowSet := make(map[string]bool)
 	for _, ns := range newShallow {
